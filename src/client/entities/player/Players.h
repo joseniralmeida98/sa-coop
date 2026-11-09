@@ -52,6 +52,7 @@ struct RemotePlayer {
     bool lookStale = false;     // a script here took its special character's slot: it went back to CJ, the look again
     uint64_t duckOffMs = 0;     // since when the copy's crouch differs from its owner's (a lost crouch press)
     uint64_t climbMs = 0;       // the copy climbed a wall by itself (CTaskSimpleClimb) last then
+    bool skateHeld = false;     // its owner's skateboard pose is written into its bones (Skate): its own tasks keep off it
     bool animHeld = false;      // a full-body activity of its owner plays on it (Anims): its own tasks keep off it
     uint64_t overlapMs = 0;     // since when it stands inside our player (KeepApart)
     bool hiddenOnSpot = false;  // hidden while both stand on one scripted spot (or gone in through a door)

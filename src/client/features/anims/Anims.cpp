@@ -258,7 +258,7 @@ public:
         // (CEventInAir), and its FALL_fall faded the owner's skydive out at once
         for (auto& [id, w] : m_remote)
             if (RemotePlayer* rp = Players::Instance().Get(id)) {
-                bool held = on && Holds(rp->ped, w);
+                bool held = (on && Holds(rp->ped, w)) || rp->skateHeld;  // skateHeld: its owner's skateboard pose (Skate)
                 if (held != rp->animHeld) LOGD("Remote player %d %s", id, held ? "held by its owner's activity" : "free of the activity");
                 rp->animHeld = held;
             }
