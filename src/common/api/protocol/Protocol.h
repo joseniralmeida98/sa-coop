@@ -128,9 +128,9 @@ enum MsgId : uint8_t {
     G_WAYPOINT = 133,         // reliable: the player's map waypoint (set or cleared)
     G_PROPERTY = 134,         // reliable: the player bought a property (its index in main.scm)
     G_HOST_SAVED = 135,       // reliable: the host saved its game, the partners save their profiles
-    G_SKATE_POSE = 187,       // unreliable (CH_STATE): u8 flags (1 = skating), u16 seq, u8 n, then n x {u32 quaternion (smallest
-                              // three), 3 x i16 mm} = each hierarchy node's pose in its ped's own space. flags 0 (reliable): it
-                              // got off the board (Skate)
+    G_SKATE_POSE = 187,       // unreliable (CH_STATE): u8 flags (1 = skating), u16 seq, u8 n, 3 x f32 the skater's position, u32
+                              // its rotation (smallest three), then n x {u32 quaternion, 3 x i16 mm} = each hierarchy node's pose
+                              // in the skater's own space. flags 0 (reliable): it got off the board (Skate)
     G_EXPORT = 186,           // reliable: the docks' export list (Exports.cpp): i8 the car of the list just delivered (-1: the host
                               // says the list), i32 what it paid, bytes the list: stage, all done, 10 x delivered, 42 x imports
     G_MISSION_FX = 185,       // reliable, host -> partner: an effect of the story mission's script: u8 op (1 make, 2 play, 3 stop, 4 play
