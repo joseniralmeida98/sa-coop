@@ -22,6 +22,7 @@
 //
 // NOT compiled with the project toolchain and NOT run in the game. Marked CONFIRM: things taken from memory.
 #include <windows.h>
+#undef GetObject  // wingdi.h: GetObject -> GetObjectA, and game::GetObject(int) would not be found by the linker
 
 #include <algorithm>
 #include <cmath>
