@@ -63,7 +63,7 @@ def targets(extra=()):
         "name": "client", "kind": "dll", "out": "coop.dll",
         "sources": glob("src/client", "**/*.cpp") + list(extra),
         "rc": glob("src/client", "*.rc"),
-        "includes": COMMON_INC + ["src/client", "third_party/minhook/include"],
+        "includes": COMMON_INC + ["src/client", "third_party/minhook/include", "third_party/minimp3"],
         "defines": ["-DCOOP_CLIENT"], "cflags": [],
         "deps": [common, ENET, MINHOOK],
         "libs": ["-lws2_32", "-lwinmm", "-lgdi32", "-luser32", "-lkernel32", "-lole32", "-loleaut32", "-lshell32", "-luuid",

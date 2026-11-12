@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <string>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -75,16 +76,17 @@ const uint8_t* Base() {
     static const uint8_t* base = []() -> const uint8_t* {
         auto* m = (const uint8_t*)GetModuleHandleA("gtskate.asi");
         if (!m) {
-            LOGD("Skate: gtskate.asi is not loaded; this game will not send a skate pose (it still shows the others')");
+            LOGI("Skate: gtskate.asi is not loaded; this game will not send a skate pose (it still shows the others')");
             return nullptr;
         }
         auto* nt = m + *(const uint32_t*)(m + 0x3C);
         uint32_t stamp = *(const uint32_t*)(nt + 8), image = *(const uint32_t*)(nt + 0x50);
         if (stamp != kStamp || image != kImage) {
-            LOGD("Skate: gtskate.asi is another build (stamp %08X, size %X): the offsets in Skate.cpp do not apply", stamp,
+            LOGI("Skate: gtskate.asi is another build (stamp %08X, size %X): the offsets in Skate.cpp do not apply", stamp,
                  image);
             return nullptr;
         }
+        LOGI("Skate: gtskate.asi found, its build matches the offsets (stamp %08X)", stamp);
         return m;
     }();
     return base;
@@ -108,6 +110,7 @@ constexpr int kBoardModel = 340;      // skate.ide (modloader\SkateMod): "340, s
 constexpr float kBoardDrop = 0.22f;   // ankle -> the model's origin: the ankle is ~0.09 over the sole, and skateboard.dff's deck
                                       // top is 0.128 over its origin (bbox x +-0.113, y +-0.45, z 0..0.128: the length is Y)
 constexpr int kFootL = 43, kFootR = 53;  // eBoneTag, CONFIRM (thighs 41/51 are the ones the sa-coop code already uses)
+constexpr float kPedToBoard = 1.0f;      // with no feet to go by: the board's origin is this far under the ped's (CJ's origin is ~1 m up)
 
 // ---- rotation <-> quaternion (inverses of each other, whatever the matrix convention) ----
 void ToQuat(const RwMat& M, float q[4]) {
@@ -251,6 +254,8 @@ struct Remote {
 std::map<uint8_t, Remote> g_remote;
 std::map<uint8_t, int> g_board;        // the partner's board: its object's handle
 std::map<uint8_t, CVector> g_boardAxis;  // its last length axis (the board's two ends look alike: keep one)
+std::map<uint8_t, std::string> g_note;   // the last thing said in the log about its board (one line per change)
+std::map<uint8_t, uint64_t> g_boardLog;  // when its board's position is next written to the log
 Pose g_local;
 bool g_localFresh = false;
 
@@ -292,8 +297,10 @@ public:
         Net().SetHandler(proto::G_SKATE_POSE, [](uint8_t from, Reader& r) { Instance().Handle(from, r); });
         // CONFIRM: 0x5E7680 = CPed::Render (from gta-reversed, not checked in a binary). GTSkate does its work in a
         // per-ped render callback, and this is the same moment. If this fails or never runs, the log says so.
-        if (!mem::HookFn(0x5E7680, &HookPedRender, &g_origPedRender, "CPed::Render"))
-            LOGD("Skate: could not hook CPed::Render; partners will not see the skate pose");
+        if (mem::HookFn(0x5E7680, &HookPedRender, &g_origPedRender, "CPed::Render"))
+            LOGI("Skate: CPed::Render hooked");
+        else
+            LOGI("Skate: could not hook CPed::Render; partners will not see the skate pose");
     }
 
     void OnPeerLeave(uint8_t id) override { Release(id); }
@@ -351,7 +358,7 @@ private:
     bool m_wasSkating = false;
     uint16_t m_seq = 0;
     uint64_t m_lastSend = 0;
-    bool m_boardWarned = false;
+    int m_sentThisRide = 0;
 
     // the copy goes back to its own tasks (Anims.cpp recomputes animHeld every frame for the players it follows)
     static void Let(RemotePlayer& rp) {
@@ -390,8 +397,13 @@ private:
 
     void SendLocal() {
         bool skating = gt::Active();
+        if (skating && !m_wasSkating) {
+            m_sentThisRide = 0;
+            LOGI("Skate: you are on the board (GTSkate's pose has %d nodes): sending it to the others", gt::Get<int32_t>(gt::kCount));
+        }
         if (!skating) {
             if (m_wasSkating) {  // the end goes reliably: a lost one would freeze the pose on the others
+                LOGI("Skate: you got off the board (%d poses sent)", m_sentThisRide);
                 Writer w(proto::G_SKATE_POSE);
                 w.U8(0);
                 w.U16(++m_seq);
@@ -417,6 +429,7 @@ private:
             PutOff(w, g_local.off[i]);
         }
         Net().Send(proto::CH_STATE, w);
+        if (++m_sentThisRide == 1) LOGI("Skate: first pose sent (%d nodes)", g_local.n);
     }
 
     // ---- remote: receive ----
@@ -425,6 +438,7 @@ private:
         uint16_t seq = r.U16();
         if (!r.Ok()) return;
         if (!(flags & 1)) {
+            if (g_remote.count(from)) LOGI("Skate: partner %d got off the board", from);
             Release(from);
             return;
         }
@@ -442,6 +456,7 @@ private:
             p.off[i] = GetOff(r);
         }
         if (!r.Ok()) return;
+        if (!s.active) LOGI("Skate: partner %d is on the board (%d nodes)", from, n);
         s.a = s.active && s.b.n == n ? s.b : p;
         s.b = p;
         s.seq = seq;
@@ -468,26 +483,41 @@ private:
     }
 
     // ---- remote: the board under its feet ----
-    int MakeBoard(CPed* holder) {
+    // one line in coop\coop.log per change of what holds the board back, so "it does not show" has a reason
+    static void Note(uint8_t id, const std::string& text) {
+        std::string& last = g_note[id];
+        if (last == text) return;
+        last = text;
+        LOGI("Skate: partner %d: %s", id, text.c_str());
+    }
+
+    int MakeBoard(uint8_t id, CPed* holder) {
         if (!IsObjectModel(kBoardModel)) {
-            if (!m_boardWarned) LOGD("Skate: model %d (modloader\\SkateMod\\skate.ide) is not here: no board for the partner", kBoardModel);
-            m_boardWarned = true;
+            Note(id, Format("model %d is not known to this game (modloader\\SkateMod\\skate.ide not loaded here?)", kBoardModel));
             return -1;
         }
         if (!IsModelLoaded(kBoardModel)) {
-            RequestModel(kBoardModel);
+            RequestModel(kBoardModel, 0x10);  // PRIORITY_REQUEST
+            Note(id, Format("model %d is loading (state %d)", kBoardModel, ModelLoadState(kBoardModel)));
             return -1;
         }
-        if (!HasRoom(ObjectPool(), kKeepObjects, "object")) return -1;
+        if (!HasRoom(ObjectPool(), kKeepObjects, "object")) {
+            Note(id, "the object pool is full");
+            return -1;
+        }
         CVector at = holder->GetPosition();
         int h = -1;
         Cmd(0x029B).I(kBoardModel).F(at.x).F(at.y).F(at.z).Out(&h).Run();  // CREATE_OBJECT_NO_OFFSET
         CObject* o = h >= 0 ? GetObject(h) : nullptr;
-        if (!o) return -1;
+        if (!o) {
+            Note(id, Format("CREATE_OBJECT gave handle %d and no object", h));
+            return -1;
+        }
         Field<uint8_t>(o, 0x13C) = 6;  // OBJECT_MISSION2, as Props.cpp: saves and snapshots do not keep it
         Cmd(0x0382).I(h).I(0).Run();   // SET_OBJECT_COLLISION: only to be seen
         Cmd(0x0550).I(h).I(1).Run();   // FREEZE_OBJECT_POSITION: it goes where PlaceBoard puts it
         MarkModelNotNeeded(kBoardModel);
+        Note(id, Format("board created (object handle %d)", h));
         return h;
     }
 
@@ -498,38 +528,51 @@ private:
             g_board.erase(it);
         }
         g_boardAxis.erase(id);
+        g_boardLog.erase(id);
+        g_note.erase(id);
     }
 
     void PlaceBoard(uint8_t id, RemotePlayer& rp, Remote& s) {
         void* hier = HierOf(rp.ped);
-        if (!hier) return;
-        int iL = NodeOf(hier, kFootL), iR = NodeOf(hier, kFootR);
-        int n = std::min({s.a.n, s.b.n});
-        if (iL < 0 || iR < 0 || iL >= n || iR >= n) return;
-
+        if (!hier) {
+            Note(id, "its copy has no skeleton yet");
+            return;
+        }
         auto bit = g_board.find(id);
         if (bit == g_board.end() || !GetObject(bit->second)) {
-            int h = MakeBoard(rp.ped);
+            int h = MakeBoard(id, rp.ped);
             if (h < 0) return;
             g_board[id] = h;
             bit = g_board.find(id);
         }
         CObject* o = GetObject(bit->second);
         CMatrix* m = o ? o->Matrix() : nullptr;
-        if (!m) return;
+        if (!m) {
+            Note(id, "the board object has no matrix");
+            return;
+        }
+
+        int iL = NodeOf(hier, kFootL), iR = NodeOf(hier, kFootR);
+        int n = std::min({s.a.n, s.b.n});
+        bool feet = iL >= 0 && iR >= 0 && iL < n && iR < n;
 
         float t = Phase(s);
-        RwMat pm, fl, fr;
+        RwMat pm;
         InterpPed(s, t, pm);
-        InterpNode(s, iL, t, pm, fl);
-        InterpNode(s, iR, t, pm, fr);
-
-        // the board lies under both feet: its length is the line between them (flattened against the ped's up)
-        CVector up = pm.at;
-        CVector axis = fl.pos - fr.pos;
-        axis = axis - up * Dot(axis, up);
-        float len = sqrtf(Dot(axis, axis));
-        axis = len > 0.05f ? axis * (1.0f / len) : pm.up;
+        CVector up = pm.at, axis = pm.up, pos = pm.pos - up * kPedToBoard;
+        if (feet) {
+            RwMat fl, fr;
+            InterpNode(s, iL, t, pm, fl);
+            InterpNode(s, iR, t, pm, fr);
+            // the board lies under both feet: its length is the line between them (flattened against the ped's up)
+            axis = fl.pos - fr.pos;
+            axis = axis - up * Dot(axis, up);
+            float len = sqrtf(Dot(axis, axis));
+            axis = len > 0.05f ? axis * (1.0f / len) : pm.up;
+            pos = (fl.pos + fr.pos) * 0.5f - up * kBoardDrop;
+        } else {
+            Note(id, Format("feet nodes not found (%d and %d of %d): the board follows the ped", iL, iR, n));
+        }
         auto last = g_boardAxis.find(id);
         if (last != g_boardAxis.end() && Dot(last->second, axis) < 0) axis = axis * -1.0f;
         g_boardAxis[id] = axis;
@@ -539,10 +582,17 @@ private:
         m->right = right;
         m->forward = axis;
         m->up = up;
-        m->pos = (fl.pos + fr.pos) * 0.5f - up * kBoardDrop;
+        m->pos = pos;
         CallMethod<0x446F90>(o);  // CEntity::UpdateRW
         CallMethod<0x532B00>(o);  // CEntity::UpdateRwFrame
         WorldAdd(o);
+
+        uint64_t& next = g_boardLog[id];  // where it is, now and then: it should be within a metre of the skater
+        if (NowMs() >= next) {
+            next = NowMs() + 5000;
+            LOGI("Skate: partner %d: board at %.2f %.2f %.2f, skater at %.2f %.2f %.2f, area %d, feet %s", id, pos.x, pos.y, pos.z,
+                 pm.pos.x, pm.pos.y, pm.pos.z, (int)o->AreaCode(), feet ? "found" : "not found");
+        }
     }
 };
 
