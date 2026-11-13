@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -71,10 +73,42 @@ constexpr float kPi = 3.14159265f;
 enum State : int { kLoading, kReady, kSeeking, kFailed, kEnded, kStopped };
 
 #ifdef MUSIC_HAVE_MP3
+// where the audio begins: past an ID3v2 tag (title, cover art ...), if the file starts with one
+size_t Id3Size(const std::vector<uint8_t>& d) {
+    if (d.size() < 10 || memcmp(d.data(), "ID3", 3) != 0) return 0;
+    for (int i = 6; i < 10; i++)
+        if (d[i] & 0x80) return 0;
+    size_t n = 10 + (((size_t)d[6] << 21) | ((size_t)d[7] << 14) | ((size_t)d[8] << 7) | (size_t)d[9]);
+    if (d[5] & 0x10) n += 10;  // a footer
+    return std::min(n, d.size());
+}
+
+// what a file that did not decode is, for the chat (so "not an MP3" says what it is)
+std::string Sniff(const std::vector<uint8_t>& d) {
+    if (d.empty()) return "the file is empty";
+    auto at = [&](size_t off, const char* t) {
+        size_t n = strlen(t);
+        return d.size() >= off + n && memcmp(d.data() + off, t, n) == 0;
+    };
+    std::string head;
+    for (size_t i = 0; i < std::min<size_t>(d.size(), 256); i++) head += (char)std::tolower(d[i]);
+    if (head.find("<html") != std::string::npos || head.find("<!doctype") != std::string::npos ||
+        head.find("<head") != std::string::npos || head.find("<body") != std::string::npos)
+        return "that is a web page, not an audio file (use a direct link to the .mp3)";
+    if (at(0, "RIFF")) return "that is a WAV file: only MP3 works";
+    if (at(0, "OggS")) return "that is an OGG file: only MP3 works";
+    if (at(0, "fLaC")) return "that is a FLAC file: only MP3 works";
+    if (at(4, "ftyp")) return "that is an M4A/MP4 (AAC) file with a .mp3 name: only real MP3 works";
+    if (d.size() > 2 && d[0] == 0xFF && (d[1] & 0xF6) == 0xF0) return "that is an AAC file: only MP3 works";
+    if (at(0, "ID3")) return "the MP3 tag is there but no audio frame could be decoded (damaged or not MPEG audio)";
+    return "that is not an MP3 file";
+}
+
 // ---- an MP3 file in memory, decoded a frame at a time and resampled to kRate ----
 struct Decoder {
     std::vector<uint8_t> data;
     mp3dec_t dec{};
+    size_t start = 0;           // where the audio begins (past an ID3 tag)
     size_t pos = 0;             // the next byte for the decoder
     int hz = 0;                 // the file's rate, known from its first frame
     std::vector<float> q;       // decoded stereo (L, R, L, R ...) at the file's rate
@@ -85,7 +119,7 @@ struct Decoder {
 
     void Reset() {
         mp3dec_init(&dec);
-        pos = 0;
+        pos = start;
         q.clear();
         head = 0;
         frac = 0;
@@ -168,7 +202,7 @@ struct Decoder {
         }
         if (!hz) return;
         q.clear();
-        pos = 0;
+        pos = start;
         mp3dec_init(&dec);
         int64_t skip = (int64_t)((double)target * hz / kRate);
         while (skip > 0) {
@@ -215,7 +249,7 @@ std::thread g_mixThread;
 int64_t PosAt(const Source& s, uint64_t t) { return t <= s.startMs ? 0 : (int64_t)(t - s.startMs) * kRate / 1000; }
 
 // ---- the download ----
-bool Download(Source& s, std::vector<uint8_t>& out, std::string& err) {
+bool Download(Source& s, std::vector<uint8_t>& out, std::string& ctype, std::string& err) {
     std::wstring w = Utf8ToWide(s.url);
     URL_COMPONENTSW uc{};
     uc.dwStructSize = sizeof(uc);
@@ -254,6 +288,11 @@ bool Download(Source& s, std::vector<uint8_t>& out, std::string& err) {
         if (status != 200) {
             err = Format("the server answered %lu", (unsigned long)status);
         } else {
+            wchar_t ct[256] = {};
+            DWORD ctl = sizeof(ct) - sizeof(wchar_t);
+            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_HEADER_NAME_BY_INDEX, ct, &ctl,
+                                    WINHTTP_NO_HEADER_INDEX))
+                for (const wchar_t* c = ct; *c; c++) ctype += (*c < 128 ? (char)*c : '?');
             ok = true;
             std::vector<uint8_t> buf(64 * 1024);
             for (;;) {
@@ -313,21 +352,26 @@ void StartSeek(const std::shared_ptr<Source>& s) {
 
 void LoadMain(std::shared_ptr<Source> s) {
     std::vector<uint8_t> data;
-    std::string err;
-    if (!Download(*s, data, err)) {
+    std::string err, ctype;
+    if (!Download(*s, data, ctype, err)) {
         s->err = err;
         s->state = s->cancel ? kStopped : kFailed;
         return;
     }
     auto d = std::make_shared<Decoder>();
     d->data = std::move(data);
+    d->start = Id3Size(d->data);
     d->Reset();
     if (!d->DecodeFrame() || !d->hz) {
-        s->err = "that is not an MP3 file";
+        char first[64] = {};
+        for (size_t i = 0; i < std::min<size_t>(d->data.size(), 12); i++) snprintf(first + i * 3, 4, "%02X ", d->data[i]);
+        LOGI("Music: %s: %u bytes, Content-Type '%s', ID3 %u bytes, starts %s-> cannot decode", s->url.c_str(),
+             (unsigned)d->data.size(), ctype.c_str(), (unsigned)d->start, first);
+        s->err = Sniff(d->data);
         s->state = kFailed;
         return;
     }
-    LOGI("Music: %s: %u bytes, %d Hz", s->url.c_str(), (unsigned)d->data.size(), d->hz);
+    LOGI("Music: %s: %u bytes, Content-Type '%s', %d Hz", s->url.c_str(), (unsigned)d->data.size(), ctype.c_str(), d->hz);
     d->Reset();
     s->dec = d;
     SeekToNow(*s);
@@ -457,6 +501,11 @@ public:
 
     void OnInstallHooks() override {
         Net().SetHandler(proto::G_MUSIC, [](uint8_t from, Reader& r) { Instance().Handle(from, r); });
+#ifdef MUSIC_HAVE_MP3
+        LOGI("Music: built with minimp3: /music <link> is on");
+#else
+        LOGI("Music: built WITHOUT minimp3 (third_party/minimp3/minimp3.h was not there at build): /music <link> is off");
+#endif
     }
     void OnPeerLeave(uint8_t id) override { Stop(id); }
     void OnSessionEnd() override { StopAll(); }
@@ -639,6 +688,7 @@ private:
     void Play(const std::string& url) {
 #ifndef MUSIC_HAVE_MP3
         (void)url;
+        LOGI("Music: /music used, but this build has no minimp3");
         ui::TheChat().AddError(TR("Эта сборка без minimp3: музыка по ссылке выключена.",
                                   "This build has no minimp3: URL music is off."));
 #else

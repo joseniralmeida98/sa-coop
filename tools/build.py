@@ -117,11 +117,19 @@ def parse_depfile(text: str):
     return files
 
 
+# A header a source takes only when it exists (#if __has_include): the .d of an object built without it does not name it, so
+# the header turning up later would not rebuild that source. Source file name -> the header.
+OPTIONAL_HEADERS = {"Music.cpp": "third_party/minimp3/minimp3.h"}
+
+
 def needs_rebuild(obj: Path, dep: Path, src: Path) -> bool:
     if not obj.exists() or not dep.exists():
         return True
     t = obj.stat().st_mtime
     if src.stat().st_mtime > t:
+        return True
+    opt = OPTIONAL_HEADERS.get(src.name)
+    if opt and (ROOT / opt).exists() and (ROOT / opt).stat().st_mtime > t:
         return True
     for f in parse_depfile(dep.read_text(errors="ignore")):
         fp = Path(f)
