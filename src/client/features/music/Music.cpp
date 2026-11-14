@@ -1,14 +1,11 @@
 // Music from a URL, out of a car's trunk (the idea of MDPM, made for SA:COOP).
 //
-//   /music <link to an MP3>   the music belongs to the vehicle YOU are in (its trunk) and stays with that vehicle: it keeps
-//                             playing from it when you get out and walk away, and everyone hears it by the distance to the
-//                             vehicle: louder near it, quieter far, left or right by where it is. On foot with no vehicle
-//                             bound yet it is silent until you get into one.
-//   /music here               moves the music to the vehicle you are in now (the song goes on)
+//   /music <link to an MP3>   the music starts in YOUR car's trunk (or around you, on foot); every player hears it
+//                             by the distance to that car: louder near it, quieter far, left or right by where it is
 //   /music stop               stops yours;   /music vol <0-100>   your volume;   /music hear <on|off>   others' links
 //
-// Only the link, the moment it started and the vehicle's network id cross the network (G_MUSIC, reliable, again every 5 s so
-// whoever comes late joins in): every game downloads the file itself (WinHTTP), decodes it (minimp3) and mixes it (waveOut), and
+// Only the link and the moment it started cross the network (G_MUSIC, reliable, again every 5 s so whoever comes late
+// joins in): every game downloads the file itself (WinHTTP), decodes it (minimp3) and mixes it (waveOut), and
 // finds its place in the song by the clock, so the games play the same second. No audio is sent between players.
 //
 // Limits: a direct link to an MP3 file (or a podcast/MP3 download), up to 40 MB. Not YouTube, Spotify or the like (they are
@@ -42,7 +39,6 @@
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
 #include "entities/player/Players.h"
-#include "entities/vehicle/Vehicles.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/config/Config.h"
 #include "shared/game/Game.h"
@@ -72,7 +68,6 @@ constexpr int64_t kResync = kRate * 3 / 2;   // out of step by more than this (f
 constexpr float kFullM = 4.0f;               // full volume up to here (metres) ...
 constexpr float kFarM = 70.0f;               // ... fading to silence here
 constexpr float kTrunkM = 2.2f;              // the trunk: behind the car's centre by this much
-constexpr float kFadePerSec = 2.5f;      // fade in/out when the owner gets in or out of a vehicle (0.4 s)
 constexpr float kPi = 3.14159265f;
 
 enum State : int { kLoading, kReady, kSeeking, kFailed, kEnded, kStopped };
@@ -235,7 +230,6 @@ struct Source {
     uint8_t owner = 0;
     uint32_t serial = 0;
     std::string url;
-    uint16_t vehId = 0;                 // the vehicle it plays from (Vehicles' network id); 0: not bound yet
     uint64_t startMs = 0;               // our clock at the song's second 0
     std::atomic<int> state{kLoading};
     std::atomic<bool> cancel{false};
@@ -244,9 +238,6 @@ struct Source {
     std::atomic<float> gL{0.0f}, gR{0.0f};  // the game thread's: how loud on each side
     float curL = 0.0f, curR = 0.0f;     // the mixer's, smoothed
     uint64_t lastBeat = 0;
-    float fade = 0.0f;                  // game thread: 1 while its owner is in a vehicle, eased to 0 when out
-    float lastV = 0.0f, lastTh = kPi / 4.0f;  // game thread: volume and side while it last had a vehicle
-    uint64_t tick = 0;                  // game thread: the last frame this source was looked at
 };
 
 std::mutex g_mu;
@@ -524,8 +515,8 @@ public:
         if (cmd != "music" && cmd != "musica") return false;
         auto say = [](const std::string& t) { ui::TheChat().AddSystem(t); };
         if (args.empty()) {
-            say(TR("Музыка по ссылке: /music <ссылка на MP3>, /music here, /music stop, /music vol <0-100>, /music hear <on|off>",
-                   "URL music: /music <link to an MP3>, /music here, /music stop, /music vol <0-100>, /music hear <on|off>"));
+            say(TR("Музыка по ссылке: /music <ссылка на MP3>, /music stop, /music vol <0-100>, /music hear <on|off>",
+                   "URL music: /music <link to an MP3>, /music stop, /music vol <0-100>, /music hear <on|off>"));
             return true;
         }
         std::string a = ToLower(args[0]);
@@ -539,20 +530,6 @@ public:
             } else {
                 g_vol = std::clamp(atoi(args[1].c_str()), 0, 100) / 100.0f;
                 say(Format(TR("Громкость музыки: %d%%.", "Music volume: %d%%."), (int)std::lround(g_vol * 100)));
-            }
-        } else if (a == "here" || a == "aqui") {
-            auto mine = Find(Net().MyId());
-            CPlayerPed* self = FindPlayerPed(0);
-            CVehicle* car = self ? self->VehicleIfIn() : nullptr;
-            NetVehicle* nv = car ? Vehicles::Instance().EnsureNetworked(car) : nullptr;
-            if (!mine) {
-                say(TR("Сначала включите музыку: /music <ссылка>.", "Start the music first: /music <link>."));
-            } else if (!nv) {
-                say(TR("Сядьте в машину, чтобы перенести музыку в неё.", "Get into a vehicle to move the music into it."));
-            } else {
-                mine->vehId = nv->netId;
-                if (Net().Online()) SendPlay(*mine);
-                say(TR("Музыка теперь играет из этой машины.", "The music now plays from this vehicle."));
             }
         } else if (a == "hear" || a == "ouvir") {
             std::string v = args.size() > 1 ? ToLower(args[1]) : "";
@@ -593,33 +570,26 @@ public:
                 Remove(s);
                 continue;
             }
-            const uint64_t now = NowMs();
-            const float dt = s->tick ? (float)(now - s->tick) / 1000.0f : 0.0f;
-            s->tick = now;
-            if (s->owner == Net().MyId() && !KeepOwn(*s, myCar)) continue;
             CVector at;
             CVehicle* car = nullptr;
-            const bool inCar = Anchor(*s, at, car);  // the vehicle's trunk, or nothing: no vehicle (yet, or here) is no sound
-            if (inCar) {
-                float gain, pan = 0.0f;
-                if (car == myCar) {  // in the same vehicle: all of it, from everywhere
-                    gain = 1.0f;
-                } else {
-                    CVector d = at - ear;
-                    float dist = std::sqrt(Dot(d, d));
-                    float x = std::clamp((dist - kFullM) / (kFarM - kFullM), 0.0f, 1.0f);
-                    gain = (1.0f - x) * (1.0f - x);
-                    if (dist > 1.0f) pan = std::clamp(Dot(d * (1.0f / dist), right), -1.0f, 1.0f);
-                }
-                s->lastTh = (pan + 1.0f) * kPi / 4.0f;  // equal power: centre = full
-                s->lastV = gain * g_vol * 1.41421356f;
+            if (!Anchor(s->owner, at, car)) {
+                s->gL = s->gR = 0.0f;
+                continue;
             }
-            const float target = inCar ? 1.0f : 0.0f;
-            s->fade += std::clamp(target - s->fade, -dt * kFadePerSec, dt * kFadePerSec);
-            const float v = s->lastV * s->fade;
-            s->gL = std::cos(s->lastTh) * v;
-            s->gR = std::sin(s->lastTh) * v;
-            if (s->owner == Net().MyId() && Net().Online() && now - s->lastBeat >= kBeatMs) SendPlay(*s);
+            float gain, pan = 0.0f;
+            if (car && car == myCar) {  // in the same car: all of it, from everywhere
+                gain = 1.0f;
+            } else {
+                CVector d = at - ear;
+                float dist = std::sqrt(Dot(d, d));
+                float x = std::clamp((dist - kFullM) / (kFarM - kFullM), 0.0f, 1.0f);
+                gain = (1.0f - x) * (1.0f - x);
+                if (dist > 1.0f) pan = std::clamp(Dot(d * (1.0f / dist), right), -1.0f, 1.0f);
+            }
+            float th = (pan + 1.0f) * kPi / 4.0f, v = gain * g_vol * 1.41421356f;  // equal power, centre = full
+            s->gL = std::cos(th) * v;
+            s->gR = std::sin(th) * v;
+            if (s->owner == Net().MyId() && Net().Online() && NowMs() - s->lastBeat >= kBeatMs) SendPlay(*s);
         }
     }
 
@@ -632,54 +602,25 @@ private:
     bool m_hear = true;
     uint32_t m_serial = (uint32_t)NowMs();
 
-    // where a song comes from: the trunk of its vehicle. That vehicle is found by its network id, so it is the same one in
-    // every game, with or without its owner in it; here it may not be (far, not made yet): then nowhere (false).
-    // Not bound yet (the first moments): the vehicle its owner is in.
-    static bool Anchor(const Source& s, CVector& at, CVehicle*& car) {
+    // where a player's music comes from: its car's trunk, or the player itself on foot
+    static bool Anchor(uint8_t owner, CVector& at, CVehicle*& car) {
+        CPed* ped = nullptr;
+        if (owner == Net().MyId()) {
+            ped = FindPlayerPed(0);
+        } else if (RemotePlayer* rp = Players::Instance().Get(owner)) {
+            ped = rp->ped;
+        }
+        if (!ped) return false;
+        car = ped->VehicleIfIn();
+        if (car) {
+            CMatrix* m = car->Matrix();
+            if (m) {
+                at = m->pos - m->forward * kTrunkM + m->up * 0.3f;
+                return true;
+            }
+        }
         car = nullptr;
-        if (s.vehId) {
-            NetVehicle* nv = Vehicles::Instance().Find(s.vehId);
-            if (nv && Vehicles::Alive(*nv)) car = nv->veh;
-        } else {
-            CPed* ped = nullptr;
-            if (s.owner == Net().MyId()) {
-                ped = FindPlayerPed(0);
-            } else if (RemotePlayer* rp = Players::Instance().Get(s.owner)) {
-                ped = rp->ped;
-            }
-            car = ped ? ped->VehicleIfIn() : nullptr;
-        }
-        CMatrix* m = car ? car->Matrix() : nullptr;
-        if (!m) {
-            car = nullptr;
-            return false;
-        }
-        at = m->pos - m->forward * kTrunkM + m->up * 0.3f;
-        return true;
-    }
-
-    static bool Wrecked(CVehicle* v) { return v->Health() <= 0.0f || v->Status() == 5; }  // STATUS_WRECKED
-
-    // our own song's side of the vehicle: bind it to the vehicle we are in (the first time we are in one), and let it go
-    // when that vehicle is wrecked. false: the song was stopped here (skip it).
-    bool KeepOwn(Source& s, CVehicle* myCar) {
-        if (!s.vehId && myCar) {
-            if (NetVehicle* nv = Vehicles::Instance().EnsureNetworked(myCar)) {
-                s.vehId = nv->netId;
-                LOGI("Music: the song is now in vehicle %04X (model %d)", nv->netId, nv->model);
-                if (Net().Online()) SendPlay(s);
-            }
-        }
-        if (s.vehId) {
-            NetVehicle* nv = Vehicles::Instance().Find(s.vehId);
-            if (nv && Vehicles::Alive(*nv) && Wrecked(nv->veh)) {
-                LOGI("Music: vehicle %04X is wrecked: the song stops", s.vehId);
-                ui::TheChat().AddSystem(TR("Машина разбита: музыка выключена.", "The vehicle is wrecked: the music stops."));
-                Stop(s.owner);
-                if (Net().Online()) SendStop();
-                return false;
-            }
-        }
+        at = ped->GetPosition();
         return true;
     }
 
@@ -725,7 +666,7 @@ private:
         StopMixer();
     }
 
-    std::shared_ptr<Source> Start(uint8_t owner, uint32_t serial, const std::string& url, uint64_t startMs) {
+    void Start(uint8_t owner, uint32_t serial, const std::string& url, uint64_t startMs) {
 #ifdef MUSIC_HAVE_MP3
         auto s = std::make_shared<Source>();
         s->owner = owner;
@@ -739,10 +680,8 @@ private:
         }
         EnsureMixer();
         std::thread([s] { LoadMain(s); }).detach();
-        return s;
 #else
         (void)owner; (void)serial; (void)url; (void)startMs;
-        return nullptr;
 #endif
     }
 
@@ -761,10 +700,6 @@ private:
         uint8_t me = Net().MyId();
         Stop(me);
         ui::TheChat().AddSystem(Format(TR("Музыка: загружаю с %s ...", "Music: loading from %s ..."), HostOf(url).c_str()));
-        CPlayerPed* self = FindPlayerPed(0);
-        if (!self || !self->VehicleIfIn())
-            ui::TheChat().AddSystem(TR("Музыка будет играть из транспорта, в который вы сядете: сядьте в машину.",
-                                       "The music plays from the vehicle you get into: get into one."));
         uint32_t serial = ++m_serial;
         Start(me, serial, url, NowMs());
         if (Net().Online())
@@ -778,7 +713,6 @@ private:
         w.U8(1);
         w.U32(s.serial);
         w.U32((uint32_t)std::min<uint64_t>(NowMs() - s.startMs, 0xFFFFFFFFu));
-        w.U16(s.vehId);
         w.Str(s.url, kMaxUrl);
         Net().Send(proto::CH_RELIABLE, w);
     }
@@ -802,23 +736,15 @@ private:
             return;
         }
         uint32_t elapsed = r.U32();
-        uint16_t vehId = r.U16();
         std::string url = r.Str(kMaxUrl);
         if (!r.Ok() || !m_hear || !ValidUrl(url)) return;
         auto s = Find(from);
-        if (s && s->serial == serial && s->url == url) {  // what it already plays: the repeat for latecomers
-            if (s->vehId != vehId) {                      // ... or it moved to another vehicle
-                s->vehId = vehId;
-                LOGI("Music: partner %d's song is now in vehicle %04X", from, vehId);
-            }
-            return;
-        }
+        if (s && s->serial == serial && s->url == url) return;  // what it already plays: the repeat for latecomers
         Stop(from);
         ui::TheChat().AddSystem(
             Format(TR("%s включает музыку (%s).", "%s plays music (%s)."), Net().PeerName(from).c_str(), HostOf(url).c_str()));
         LOGI("Music: partner %d plays %s from %u ms", from, url.c_str(), elapsed);
-        auto n = Start(from, serial, url, NowMs() - elapsed);
-        if (n) n->vehId = vehId;
+        Start(from, serial, url, NowMs() - elapsed);
     }
 };
 

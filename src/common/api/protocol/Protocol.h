@@ -129,8 +129,7 @@ enum MsgId : uint8_t {
     G_PROPERTY = 134,         // reliable: the player bought a property (its index in main.scm)
     G_HOST_SAVED = 135,       // reliable: the host saved its game, the partners save their profiles
     G_MUSIC = 188,            // reliable (Music.cpp): u8 op (1 play, 0 stop), u32 serial of the song; op 1: u32 ms since its start,
-                              // u16 network id of the vehicle it plays from (0: none yet), str its link. Again every 5 s while it
-                              // plays, so whoever joins late joins in. Every game downloads it
+                              // str its link. Again every 5 s while it plays, so whoever joins late joins in. Every game downloads it
     G_SKATE_POSE = 187,       // unreliable (CH_STATE): u8 flags (1 = skating), u16 seq, u8 n, 3 x f32 the skater's position, u32
                               // its rotation (smallest three), then n x {u32 quaternion, 3 x i16 mm} = each hierarchy node's pose
                               // in the skater's own space. flags 0 (reliable): it got off the board (Skate)
