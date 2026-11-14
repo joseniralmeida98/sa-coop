@@ -8,7 +8,7 @@
 
 namespace coop {
 // Bumped on any incompatible change of the network protocol.
-constexpr uint32_t kProtocolVersion = 56;
+constexpr uint32_t kProtocolVersion = 57;
 constexpr uint16_t kDefaultPort = 7788;
 // Size of gta_sa.exe 1.0 US (HOODLUM) — the only supported executable.
 constexpr uint32_t kSupportedExeSize = 14383616;
